@@ -110,4 +110,4 @@ and prints a comparison table. See `mokuro/benchmark_mokuro.py`.
 - **CPU only**: batched inference with modest thread count; graceful fallback.
 
 **Developed**: December 2025, refreshed for the v0.2.5 rebase (fork v0.3.0b).
-**Optimization work**: led by GolyBidoof with the help of **DeepSeek V4**.
+**Optimization work**: led by GolyBidoof with the help of **DeepSeek V4 Flash**.

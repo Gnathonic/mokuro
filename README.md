@@ -362,7 +362,7 @@ The fork's changes are deliberately confined to a handful of files
   license unmodified; any use must comply with GPL-3.0.
 - Upstream: [kha-white/mokuro](https://github.com/kha-white/mokuro) by
   [Maciej Budyś](https://github.com/kha-white).
-- Optimizations developed and refined with the help of **DeepSeek V4**,
+- Optimizations developed and refined with the help of **DeepSeek V4 Flash**,
   under the direction of **GolyBidoof** (this fork's maintainer).
 - Text detection: [comic-text-detector](https://github.com/dmMaze/comic-text-detector);
   OCR: [manga-ocr](https://github.com/kha-white/manga-ocr);

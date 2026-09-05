@@ -113,7 +113,7 @@ mokuro --ocr_batch_size 64 /path/to/manga/vol1
 Make it permanent for every run — edit `mokuro/config.py`:
 
 ```python
-NUM_BEAMS = 1        # greedy decoding everywhere
+NUM_BEAMS = 1  # greedy decoding everywhere
 OCR_BATCH_SIZE = 64  # you have a 16 GB GPU
 ```
 

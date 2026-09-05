@@ -1,9 +1,10 @@
 [project]
 name = "mokuro"
 authors = [
+    {name = "GolyBidoof"},
     {name = "Maciej Budyś", email = "kha-white@mail.com"},
 ]
-description = "Browser reader for manga with selectable text"
+description = "Browser reader for manga with selectable text (performance-optimized fork)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}

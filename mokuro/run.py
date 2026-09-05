@@ -1,20 +1,19 @@
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Sequence, Optional, Union
 
 import fire
 from loguru import logger
 
-from mokuro import MokuroGenerator
-from mokuro import __version__
+from mokuro import MokuroGenerator, __version__
 from mokuro.legacy.overlay_generator import generate_legacy_html
 from mokuro.volume import VolumeCollection
 
 
 def run(
-    *paths: Optional[Sequence[Union[str, Path]]],
-    parent_dir: Optional[Union[str, Path]] = None,
+    *paths: Sequence[str | Path] | None,
+    parent_dir: str | Path | None = None,
     pretrained_model_name_or_path: str = "kha-white/manga-ocr-base",
     force_cpu: bool = False,
     disable_confirmation: bool = False,
@@ -24,6 +23,9 @@ def run(
     unzip: bool = False,
     legacy_html: bool = True,
     as_one_file: bool = True,
+    num_workers: int | None = None,
+    ocr_batch_size: int | None = None,
+    num_beams: int | None = None,
     version: bool = False,
 ):
     """
@@ -33,7 +35,7 @@ def run(
         paths: Paths to manga volumes. Volume can be a directory, a zip file or a cbz file.
         parent_dir: Parent directory to scan for volumes. If provided, all volumes inside this directory will be processed.
         pretrained_model_name_or_path: Name or path of the manga-ocr model.
-        force_cpu: Force the use of CPU even if CUDA is available.
+        force_cpu: Force the use of CPU even if CUDA/MPS is available.
         disable_confirmation: Disable confirmation prompt. If False, the user will be prompted to confirm the list of volumes to be processed.
         disable_ocr: Disable OCR processing. Generate mokuro/HTML files without OCR results.
         ignore_errors: Continue processing volumes even if an error occurs.
@@ -41,6 +43,9 @@ def run(
         unzip: Extract volumes in zip/cbz format in their original location.
         legacy_html: Enable legacy HTML output. If True, acts as if --unzip is True.
         as_one_file: Applies only to legacy HTML. If False, generate separate CSS and JS files instead of embedding them in the HTML file.
+        num_workers: Pages processed concurrently per chunk. Default: auto-detected from hardware (see mokuro/config.py).
+        ocr_batch_size: Text-line crops per batched OCR call. Default: auto-detected from hardware.
+        num_beams: Beam width for OCR decoding. Default: model default (4, highest quality). Use 1 for faster greedy decoding.
         version: Print the version of mokuro and exit.
     """
 
@@ -117,7 +122,12 @@ def run(
             return
 
     mg = MokuroGenerator(
-        pretrained_model_name_or_path=pretrained_model_name_or_path, force_cpu=force_cpu, disable_ocr=disable_ocr
+        pretrained_model_name_or_path=pretrained_model_name_or_path,
+        force_cpu=force_cpu,
+        disable_ocr=disable_ocr,
+        num_workers=num_workers,
+        ocr_batch_size=ocr_batch_size,
+        num_beams=num_beams,
     )
 
     with TemporaryDirectory() as tmp_dir:

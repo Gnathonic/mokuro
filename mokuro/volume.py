@@ -92,6 +92,10 @@ class Volume:
     def path_ocr_cache(self):
         return self.path_mokuro.parent / "_ocr" / self.path_mokuro.stem
 
+    def get_ocr_path(self, img_path_rel):
+        """Path to the cached OCR JSON for a page image (mirrors upstream layout)."""
+        return (self.path_ocr_cache / img_path_rel).with_suffix(".json")
+
     @property
     def path_title(self):
         return self.path_mokuro.parent

@@ -22,6 +22,15 @@ from mokuro.config import (
 )
 from mokuro.utils import imread
 
+_log_once_seen: set = set()
+
+def _log_once(msg: str) -> None:
+    """Log a warning once per unique message (avoids flooding on batch errors)."""
+    if msg in _log_once_seen:
+        return
+    _log_once_seen.add(msg)
+    logger.warning(f"[mokuro] {msg}")
+
 # Suppress noisy transformers warnings (e.g. "Some weights not used")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
@@ -216,7 +225,19 @@ class MangaPageOcr:
                 generated_ids = self.mocr.model.generate(pixel_values, **gen_args)
 
             texts = self.mocr.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-            all_texts.extend(ocr_post_process(text) for text in texts)
+            for text in texts:
+                # batch_decode can return bare token ids (int) for some inputs;
+                # post_process (jaconv/tokenizer) calls str methods on the item
+                # and would raise "'int' object has no attribute 'lower'".
+                # Coerce defensively — identical to a str, and preserves stock
+                # behaviour (stock manga-ocr's post_process only ever sees str).
+                if not isinstance(text, str):
+                    _log_once(
+                        "non-str decode item in recognize_text batch "
+                        f"(type={type(text).__name__}, value={text!r}); coercing to str"
+                    )
+                    text = str(text) if text is not None else ""
+                all_texts.extend([ocr_post_process(text)])
 
         return all_texts
 

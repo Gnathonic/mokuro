@@ -1,11 +1,23 @@
 """Central configuration for mokuro's performance-related defaults.
 
-This is the *single* place to tune how mokuro uses your hardware. Every value
-in this file is a default: CLI flags (``--num_workers``, ``--ocr_batch_size``,
-``--num_beams``) always override it, and library callers can pass the same
-arguments directly to :class:`mokuro.mokuro_generator.MokuroGenerator`.
+**This is the only file you normally need to edit** to tune how mokuro uses
+your machine. Every value below is a *default*: command-line flags
+(``--num_workers``, ``--ocr_batch_size``, ``--num_beams``) and library
+arguments always take precedence over it, but if you never pass flags, the
+values chosen here (or auto-detected from your hardware) apply everywhere —
+CLI, mokuro-bridge, and library callers alike.
 
-Edit the numbers below to change the out-of-the-box behaviour on your machine.
+Quick guide to what matters on your machine:
+
+* **Apple Silicon (M1–M4)** — unified memory lets you run a high worker count
+  and a large OCR batch. Defaults: 8 workers, batch 64, fp16 on.
+* **NVIDIA GPU (CUDA)** — the GPU is the bottleneck, so fewer workers (4) and
+  a moderate batch (32) avoid memory pressure; fp16, conv+bn fusion and
+  ``torch.compile`` give the biggest wins here.
+* **CPU only** — modest concurrency (cores / 2) and a small batch (16) keep
+  latency per page low; fp16/fusion are irrelevant on CPU.
+* Running out of memory? Lower ``OCR_BATCH_SIZE`` / ``NUM_WORKERS``.
+* Want better OCR accuracy at the cost of speed? Raise ``NUM_BEAMS`` to 4.
 """
 
 import os
@@ -13,12 +25,57 @@ import platform
 
 import torch
 
-# ---------------------------------------------------------------------------
-# Parallel page processing
-# ---------------------------------------------------------------------------
-# How many pages are OCR'd per chunk (the generator processes a chunk of
-# pages, then runs batched OCR over all of their text-line crops at once).
+# ===========================================================================
+# ⚙️  EDIT ME — per-machine tuning knobs
+# ===========================================================================
+# Set a knob to a concrete value to force it everywhere; leave it ``None`` to
+# keep the automatic, hardware-aware default (functions at the bottom of this
+# file). CLI flags still override whichever choice you make here.
+
+# -- concurrency ------------------------------------------------------------
+# Pages loaded & detected concurrently per processing chunk.
+#   Apple Silicon: 8 · NVIDIA: 4 · CPU: cores / 2      (None = auto)
+NUM_WORKERS = None
+
+# Text-line crops sent to the OCR model per batched generate() call.
+# Bigger batches use the GPU better but need more memory.
+#   Apple Silicon: 64 · NVIDIA: 32 · CPU: 16           (None = auto)
+OCR_BATCH_SIZE = None
+
+# Pages processed per chunk before a batched OCR pass runs.
+# (The effective chunk is max(OCR_CHUNK_SIZE, num_workers).)
 OCR_CHUNK_SIZE = 8
+
+# Threads used to decode page images (disk I/O is the bottleneck, so more
+# than ~4 rarely helps and can hurt on spinning disks / network mounts).
+IMAGE_LOAD_THREADS = 4
+
+# -- OCR decoding quality vs. speed -----------------------------------------
+# Beam width for the OCR transformer:
+#   None -> use the model's own generation config (num_beams=4 — identical
+#           output to upstream mokuro / manga-ocr, best accuracy)
+#   1    -> greedy decoding (fastest; occasionally misreads ambiguous glyphs)
+#   4    -> force beam search (matches upstream default quality)
+NUM_BEAMS = None
+
+# -- GPU feature toggles ----------------------------------------------------
+# fp16 (half precision) inference on CUDA/MPS. Big speedup on GPU, negligible
+# accuracy loss. Only applies when a GPU is active; ignored on CPU.
+USE_FP16 = True
+
+# Fold batch-norm layers into the preceding conv layers of the text detector
+# at load time. Free inference speedup, output is unchanged. Keep on unless a
+# custom detector model misbehaves.
+FUSE_CONV_BN = True
+
+# torch.compile the text detector + OCR encoder. Currently applied on CUDA
+# only (MPS/CPU support in torch.compile is still immature). Saves a few % on
+# throughput at the cost of a longer one-time startup compile.
+USE_TORCH_COMPILE = True
+
+# ===========================================================================
+# Automatic hardware detection — usually nothing to edit below this line.
+# ===========================================================================
 
 
 def get_device() -> str:
@@ -41,8 +98,12 @@ def get_default_num_workers() -> int:
 
     Apple Silicon machines benefit from a high worker count thanks to their
     unified memory and many cores; NVIDIA GPUs are usually memory-bound, and
-    plain CPUs prefer a modest thread count.
+    plain CPUs prefer a modest thread count. Override by setting
+    ``NUM_WORKERS`` above.
     """
+    if NUM_WORKERS is not None:
+        return NUM_WORKERS
+
     cpu_count = os.cpu_count() or 4
 
     if is_apple_silicon():
@@ -61,8 +122,12 @@ def get_default_ocr_batch_size() -> int:
 
     Unified memory (Apple Silicon) tolerates larger batches without OOM;
     dedicated NVIDIA GPUs usually sit well in the 32-64 range; CPUs want small
-    batches to keep latency per page low.
+    batches to keep latency per page low. Override by setting
+    ``OCR_BATCH_SIZE`` above.
     """
+    if OCR_BATCH_SIZE is not None:
+        return OCR_BATCH_SIZE
+
     device = get_device()
 
     if device == "mps":

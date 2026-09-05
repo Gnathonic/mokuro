@@ -59,21 +59,62 @@ processed, not *what* is produced.
 
 ## Easy-to-edit parameters
 
-Everything is tuned in one file: **`mokuro/config.py`**. Edit it and the new
-defaults apply everywhere (CLI, library, `ocr_folder`-style callers). You can
-also override per run:
+**Everything is tuned in one file: [`mokuro/config.py`](mokuro/config.py).**
+Open it and you'll find a clearly marked *"EDIT ME"* block at the top with a
+comment on every knob telling you what it does and what values suit which
+hardware. Edit it, save, and the new defaults apply everywhere — CLI,
+mokuro-bridge and library callers. No code changes needed.
 
-| CLI flag | Config constant | Default | Purpose |
+> Command-line flags always override the config file: `--num_workers`,
+> `--ocr_batch_size` and `--num_beams` win for that one run.
+
+### The knobs
+
+| Config constant | What it controls | Recommended values | Set to `None` |
 |---|---|---|---|
-| `--num_workers` | `get_default_num_workers()` | Apple Silicon: 8 · CUDA: 4 · CPU: cores/2 | Pages processed concurrently per chunk |
-| `--ocr_batch_size` | `get_default_ocr_batch_size()` | MPS: 64 · CUDA: 32 · CPU: 16 | Text-line crops per batched OCR call |
-| `--num_beams` | — (model default: 4) | 4 | Beam width for OCR decoding. `--num_beams 1` = greedy (fast) |
-| — | `OCR_CHUNK_SIZE` | 8 | Pages per processing chunk |
+| `NUM_WORKERS` | Pages processed per chunk before a batched OCR pass | Apple Silicon: **8** · NVIDIA: **4** · CPU: **cores/2** | auto-detect |
+| `OCR_BATCH_SIZE` | Text-line crops per batched OCR `generate()` call | MPS: **64** · CUDA: **32** · CPU: **16** | auto-detect |
+| `OCR_CHUNK_SIZE` | Pages per processing chunk (floored to `NUM_WORKERS`) | **8** | — |
+| `IMAGE_LOAD_THREADS` | Threads decoding page images (disk-I/O bound) | **4** | — |
+| `NUM_BEAMS` | OCR beam width: `1` = greedy/fast, `4` = best accuracy | **`None`** (model default, 4) | model default (4) |
+| `USE_FP16` | Half-precision inference on CUDA/MPS | **`True`** | — |
+| `FUSE_CONV_BN` | Fold batch-norm into conv layers of the text detector | **`True`** | — |
+| `USE_TORCH_COMPILE` | `torch.compile` the models (CUDA only) | **`True`** | — |
 
-Example — trade a little speed for noticeably faster OCR (greedy decoding):
+### How to choose values for your machine
+
+- **Apple Silicon (M1–M4)** — unified memory likes big batches and lots of
+  workers. Leave `None` and you get 8 workers / batch 64 / fp16. If you run
+  long volumes and memory pressure builds, lower `OCR_BATCH_SIZE` to 48 or 32.
+- **NVIDIA GPU (CUDA)** — auto: 4 workers / batch 32 / fp16 + fusion +
+  `torch.compile`. If you hit "CUDA out of memory", drop `OCR_BATCH_SIZE` to
+  16 first; if you have a high-VRAM card (12 GB+), raise it to 64.
+- **CPU only** — auto: cores/2 workers / batch 16. `USE_FP16` and
+  `USE_TORCH_COMPILE` do nothing on CPU; `FUSE_CONV_BN` still helps a little.
+- **Accuracy vs. speed** — the default (`NUM_BEAMS = None`) matches upstream's
+  beam search (4) for identical output. If you want the fastest possible OCR,
+  set `NUM_BEAMS = 1` (greedy) — on ambiguous glyphs you may occasionally see
+  a different character than beam search would pick.
+
+### Examples
+
+Trade a little speed for faster (greedy) OCR, just for one run:
 
 ```bash
 mokuro --num_beams 1 /path/to/manga/vol1
+```
+
+Force a large batch on a beefy GPU, just for one run:
+
+```bash
+mokuro --ocr_batch_size 64 /path/to/manga/vol1
+```
+
+Make it permanent for every run — edit `mokuro/config.py`:
+
+```python
+NUM_BEAMS = 1        # greedy decoding everywhere
+OCR_BATCH_SIZE = 64  # you have a 16 GB GPU
 ```
 
 ## Performance
@@ -299,9 +340,26 @@ python3 -m pytest tests/          # run the test suite (CPU)
 python3 -m ruff check mokuro/     # lint
 ```
 
+## Keeping in sync with upstream
+
+This fork tracks [kha-white/mokuro](https://github.com/kha-white/mokuro).
+To pull the latest upstream changes into your clone:
+
+```bash
+git remote add upstream https://github.com/kha-white/mokuro.git   # once
+git fetch upstream
+git merge upstream/master          # resolve conflicts, then commit
+git submodule update --init --recursive
+```
+
+The fork's changes are deliberately confined to a handful of files
+(`mokuro/config.py`, `mokuro/manga_page_ocr.py`, `mokuro/mokuro_generator.py`,
+`mokuro/run.py`, `mokuro/volume.py` + docs), so merges stay small.
+
 ## License & credits
 
-- MIT — see [LICENSE](LICENSE) (upstream license, unmodified).
+- **GPL-3.0** — see [LICENSE](LICENSE). This fork inherits upstream mokuro's
+  license unmodified; any use must comply with GPL-3.0.
 - Upstream: [kha-white/mokuro](https://github.com/kha-white/mokuro) by
   [Maciej Budyś](https://github.com/kha-white).
 - Optimizations developed and refined with the help of **DeepSeek V4**,

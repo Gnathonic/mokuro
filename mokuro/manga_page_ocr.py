@@ -12,7 +12,14 @@ from scipy.signal.windows import gaussian
 from comic_text_detector.inference import TextDetector
 from mokuro import __version__
 from mokuro.cache import cache
-from mokuro.config import get_device
+from mokuro.config import (
+    FUSE_CONV_BN,
+    NUM_BEAMS,
+    USE_FP16,
+    USE_TORCH_COMPILE,
+    get_default_ocr_batch_size,
+    get_device,
+)
 from mokuro.utils import imread
 
 # Suppress noisy transformers warnings (e.g. "Some weights not used")
@@ -48,8 +55,9 @@ class MangaPageOcr:
             )
 
             # Fold batch-norm into preceding conv layers: a free speedup at
-            # inference time, no effect on output.
-            if hasattr(self.text_detector.net, "fuse"):
+            # inference time, no effect on output. Toggle via FUSE_CONV_BN
+            # in mokuro/config.py.
+            if FUSE_CONV_BN and hasattr(self.text_detector.net, "fuse"):
                 try:
                     self.text_detector.net.fuse()
                     logger.info("Fused conv+bn layers in text detector")
@@ -61,7 +69,8 @@ class MangaPageOcr:
             # Move the OCR transformer to the active device and use half
             # precision on GPUs for faster inference with negligible accuracy
             # loss (the model was trained with fp32, fp16 is fine for OCR).
-            if device != "cpu":
+            # Toggle via USE_FP16 in mokuro/config.py.
+            if device != "cpu" and USE_FP16:
                 try:
                     self.mocr.model.to(device)
                     self.mocr.model.half()
@@ -69,8 +78,9 @@ class MangaPageOcr:
                 except Exception as e:
                     logger.warning(f"Could not move model to {device}: {e}. Falling back to default.")
 
-            # torch.compile on CUDA only — MPS support is unstable in PyTorch 2.x.
-            if device == "cuda" and hasattr(torch, "compile"):
+            # torch.compile on CUDA only — MPS support is unstable in PyTorch
+            # 2.x. Toggle via USE_TORCH_COMPILE in mokuro/config.py.
+            if device == "cuda" and USE_TORCH_COMPILE and hasattr(torch, "compile"):
                 try:
                     self.text_detector.net = torch.compile(self.text_detector.net, mode="reduce-overhead")
                     self.mocr.model.encoder = torch.compile(self.mocr.model.encoder, mode="reduce-overhead")
@@ -151,7 +161,7 @@ class MangaPageOcr:
 
         return result, all_crops, crop_metadata
 
-    def recognize_text(self, crops, batch_size=64, **generation_kwargs):
+    def recognize_text(self, crops, batch_size=None, **generation_kwargs):
         """Run batched OCR over a list of PIL crops, returning one text per crop.
 
         Batching turns many small per-line ``generate()`` calls into one call
@@ -160,9 +170,14 @@ class MangaPageOcr:
 
         Decoding defaults match manga-ocr's behaviour exactly: the model's own
         generation config (beam search, ``num_beams=4``) is used unless
-        overridden (e.g. ``num_beams=1`` for greedy/fast decoding).
+        overridden (e.g. ``num_beams=1`` for greedy/fast decoding). The
+        machine-wide default for ``batch_size`` and ``num_beams`` lives in
+        ``mokuro/config.py``.
         """
         all_texts = []
+
+        if batch_size is None:
+            batch_size = get_default_ocr_batch_size()
 
         gen_config = self.mocr.model.generation_config
         gen_args = {
@@ -171,10 +186,14 @@ class MangaPageOcr:
             "do_sample": getattr(gen_config, "do_sample", False),
             "use_cache": True,
         }
-        gen_args.update(generation_kwargs)
-        # Drop explicit Nones so they fall back to the model's generation
-        # config (manga-ocr's __call__ passes no decoding overrides at all).
-        gen_args = {k: v for k, v in gen_args.items() if v is not None}
+        # Explicit Nones fall back to the model's generation config
+        # (manga-ocr's __call__ passes no decoding overrides at all).
+        overrides = {k: v for k, v in generation_kwargs.items() if v is not None}
+        # A machine-wide beam default set in mokuro/config.py wins over the
+        # model config unless the caller passed num_beams explicitly.
+        if NUM_BEAMS is not None and "num_beams" not in overrides:
+            overrides["num_beams"] = NUM_BEAMS
+        gen_args.update(overrides)
 
         device = self.mocr.model.device
         model_dtype = next(self.mocr.model.parameters()).dtype

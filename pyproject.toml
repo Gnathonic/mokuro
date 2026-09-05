@@ -41,7 +41,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kha-white/mokuro"
+# TODO: point these at your fork before publishing.
+Homepage = "https://github.com/<your-username>/mokuro"
+# Upstream (attribution):
+Upstream = "https://github.com/kha-white/mokuro"
 
 [build-system]
 requires = ["setuptools >= 61.0.0", "setuptools_scm"]

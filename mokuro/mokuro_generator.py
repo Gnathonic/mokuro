@@ -5,7 +5,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from mokuro import __version__
-from mokuro.config import OCR_CHUNK_SIZE, get_default_num_workers, get_default_ocr_batch_size
+from mokuro.config import IMAGE_LOAD_THREADS, OCR_CHUNK_SIZE, get_default_num_workers, get_default_ocr_batch_size
 from mokuro.manga_page_ocr import MangaPageOcr
 from mokuro.utils import dump_json, imread, load_json
 from mokuro.volume import Volume
@@ -89,7 +89,7 @@ class MokuroGenerator:
                     key, img_path_rel = item
                     return key, img_path_rel, imread(volume.path_in / img_path_rel)
 
-                with ThreadPoolExecutor(max_workers=min(4, len(to_process))) as executor:
+                with ThreadPoolExecutor(max_workers=min(IMAGE_LOAD_THREADS, len(to_process))) as executor:
                     loaded = list(executor.map(read_image, to_process))
 
                 # Detect text blocks per page (sequential; detection is GPU-bound).

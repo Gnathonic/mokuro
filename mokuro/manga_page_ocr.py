@@ -34,61 +34,6 @@ def _log_once(msg: str) -> None:
 # Suppress noisy transformers warnings (e.g. "Some weights not used")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
-import contextlib
-
-
-@contextlib.contextmanager
-def _quiet_model_load():
-    """Temporarily silence the tqdm download bar and the transformers
-    'MangaOcrModel LOAD REPORT' banner while manga-ocr loads its models.
-    Everything else (loguru logs, real warnings) still passes through."""
-    import logging
-
-    # tqdm bar → devnull
-    tqdm_orig = None
-    try:
-        import tqdm.auto
-        tqdm_orig = tqdm.auto.tqdm
-        tqdm.auto.tqdm = lambda *a, **k: _NullProgress()
-    except Exception:
-        pass
-    # transformers logging (LOAD REPORT is a logging.info from transformers)
-    tf_logger = None
-    try:
-        from transformers import logging as tf_logging
-        tf_logger = tf_logging.get_logger("transformers")
-        tf_logger_prev = tf_logger.level
-        tf_logger.setLevel(logging.ERROR)
-    except Exception:
-        tf_logger_prev = None
-    try:
-        yield
-    finally:
-        if tqdm_orig is not None:
-            try:
-                import tqdm.auto
-                tqdm.auto.tqdm = tqdm_orig
-            except Exception:
-                pass
-        if tf_logger is not None:
-            tf_logger.setLevel(tf_logger_prev)
-
-
-class _NullProgress:
-    """Minimal tqdm stand-in that accepts any call and does nothing."""
-    def __init__(self, *a, **k):
-        pass
-    def __enter__(self):
-        return self
-    def __exit__(self, *a):
-        return False
-    def update(self, *a, **k):
-        pass
-    def close(self, *a, **k):
-        pass
-    def __getattr__(self, _):
-        return lambda *a, **k: None
-
 # Cache gaussian windows keyed by (size, std) — they only depend on text_height.
 _gaussian_cache = {}
 
@@ -128,8 +73,7 @@ class MangaPageOcr:
                 except Exception:
                     pass
 
-            with _quiet_model_load():
-                self.mocr = MangaOcr(pretrained_model_name_or_path, force_cpu)
+            self.mocr = MangaOcr(pretrained_model_name_or_path, force_cpu)
 
             # Move the OCR transformer to the active device and use half
             # precision on GPUs for faster inference with negligible accuracy

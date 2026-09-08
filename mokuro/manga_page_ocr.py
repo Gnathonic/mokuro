@@ -14,6 +14,7 @@ from mokuro import __version__
 from mokuro.cache import cache
 from mokuro.config import (
     ALLOW_CUDNN_TF32,
+    DETECTOR_CPU_CHANNELS_LAST,
     FUSE_CONV_BN,
     NUM_BEAMS,
     USE_FP16,
@@ -80,6 +81,15 @@ class MangaPageOcr:
                     )
                 except Exception as e:  # noqa: BLE001 - opt-in fast path; fall back to the unfused net
                     logger.warning(f"FUSE_CONV_BN: fuse() failed ({e}); using the unfused detector")
+
+            # CPU only: channels_last memory format keeps oneDNN's blocked
+            # layout across conv layers (~2x on the detector forward).
+            if device == "cpu" and DETECTOR_CPU_CHANNELS_LAST:
+                try:
+                    self.text_detector.net = self.text_detector.net.to(memory_format=torch.channels_last)
+                    self.text_detector.channels_last = True
+                except Exception as e:  # noqa: BLE001 - optional layout; keep the default memory format
+                    logger.warning(f"channels_last for text detector skipped: {e}")
 
             self.mocr = MangaOcr(pretrained_model_name_or_path, force_cpu)
 

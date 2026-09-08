@@ -1,4 +1,3 @@
-import contextlib
 import queue
 from json import JSONDecodeError
 
@@ -287,8 +286,10 @@ class MokuroGenerator:
             self.shard_pool = None
 
     def __del__(self):
-        with contextlib.suppress(Exception):  # __del__ must never raise
+        try:  # __del__ must never raise; at interpreter shutdown module globals may already be None
             self.close()
+        except Exception:  # noqa: BLE001, S110
+            pass
 
     def process_volume(self, volume: Volume, ignore_errors=False, no_cache=False):
         volume.path_ocr_cache.mkdir(parents=True, exist_ok=True)

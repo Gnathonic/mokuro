@@ -71,6 +71,11 @@ def run(
 
     logger.info("Scanning paths...")
 
+    if isinstance(fp16, str):
+        # python-fire parses "--fp16 <path>" as fp16="<path>"; keep the path and treat the flag as set.
+        paths = (fp16, *paths)
+        fp16 = True
+
     paths_ = []
     for path in paths:
         path_normalized = Path(str(path)).expanduser().absolute()

@@ -282,6 +282,8 @@ Any `import mokuro` under that interpreter now resolves to the fork. Caveats:
   and never runs OCR locally.
 
 ## Usage
+> Note: the CLI uses python-fire, so a boolean flag placed directly before a path consumes it (`--fp16 /path/vol` reads as `fp16="/path/vol"`). Write `--fp16=True`, or put flags after the paths; `--fp16` also tolerates the bare form by treating the value as the first path.
+
 
 ## Run on one volume
 

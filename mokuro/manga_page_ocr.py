@@ -17,6 +17,7 @@ from mokuro.config import (
     FUSE_CONV_BN,
     LAZY_MASK_REFINE,
     NUM_BEAMS,
+    OCR_PREPROCESS_SINGLE_PLANE,
     SKIP_CROSS_ATTN_CACHE_REORDER,
     USE_CUSTOM_BEAM,
     USE_TORCH_COMPILE,
@@ -132,6 +133,7 @@ class MangaPageOcr:
                     logger.debug(f"torch.compile skipped: {e}")
 
             self._device = device
+            self.single_plane = bool(OCR_PREPROCESS_SINGLE_PLANE)
             # set by the generator when worker processes are in use: the
             # detector's host copies then go straight into shared memory.
             self._share = False
@@ -173,7 +175,8 @@ class MangaPageOcr:
         return {
             "input_size": self.detector_input_size,
             "pp_kwargs": self.page_ops_kwargs(),
-            "processor": self.mocr.processor,
+            "single_plane": self.single_plane,
+            "processor": None if self.single_plane else self.mocr.processor,
             "config": _config.snapshot(),
         }
 
@@ -239,7 +242,7 @@ class MangaPageOcr:
         gen_args = self.generation_args(**generation_kwargs)
 
         for i in range(0, len(crops), batch_size):
-            pixel_values = ocr_preprocess(crops[i : i + batch_size], self.mocr.processor)
+            pixel_values = ocr_preprocess(crops[i : i + batch_size], self.mocr.processor, self.single_plane)
             all_texts.extend(self.generate_texts(pixel_values, gen_args))
 
         return all_texts
@@ -266,14 +269,17 @@ class MangaPageOcr:
         return gen_args
 
     def generate_texts(self, pixel_values, gen_args):
-        """OCR one preprocessed batch (float32 CPU ``(N,3,224,224)`` tensor from
-        ``page_ops.ocr_preprocess``) -> list of texts."""
+        """OCR one preprocessed batch (float32 CPU tensor from ``page_ops.ocr_preprocess``,
+        ``(N,1,224,224)`` or ``(N,3,224,224)``) -> list of texts."""
         device = self.mocr.model.device
         model_dtype = next(self.mocr.model.parameters()).dtype
 
         pixel_values = pixel_values.to(device, non_blocking=True)
         if model_dtype == torch.float16:
             pixel_values = pixel_values.half()
+        if pixel_values.shape[1] == 1:
+            # single grayscale plane -> the model's 3 identical channels
+            pixel_values = pixel_values.expand(-1, 3, -1, -1).contiguous()
 
         with torch.inference_mode():
             if self._beam is not None and self._beam.matches(gen_args):

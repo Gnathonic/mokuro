@@ -21,10 +21,10 @@ driver loop in :func:`mokuro.mokuro_generator.process_pages` is identical for
 both, so the output is the same by construction.
 
 ``cfg`` (shared by both pools): ``input_size`` (detector), ``pp_kwargs``
-(kwargs of ``page_ops.postprocess_page``), ``processor`` (the stock
-``ViTImageProcessor`` for the OCR preprocessing), ``config``
-(``mokuro.config.snapshot()`` so that runtime overrides reach the spawned
-interpreters).
+(kwargs of ``page_ops.postprocess_page``), ``single_plane`` and ``processor``
+(OCR preprocessing; the stock ``ViTImageProcessor`` is only shipped when the
+single-plane path is off), ``config`` (``mokuro.config.snapshot()`` so that
+runtime overrides reach the spawned interpreters).
 """
 
 import atexit
@@ -89,7 +89,7 @@ def _run_task(task, cfg, ops):
             result, crops, meta = postprocess_page(
                 img_t.numpy(), det, mask_t, lines_t, dw, dh, cfg["input_size"], **cfg["pp_kwargs"]
             )
-            pv = ocr_preprocess(crops, cfg["processor"])
+            pv = ocr_preprocess(crops, cfg.get("processor"), cfg.get("single_plane", True))
             return ("post", idx, result, meta, pv)
         return ("err", idx, kind, f"unknown task {kind}")
     except Exception as e:  # noqa: BLE001 - returned to the driver as an "err" result; the worker keeps running

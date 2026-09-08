@@ -134,6 +134,12 @@ LAZY_MASK_REFINE = True
 # the detector forward; no effect on GPU.
 DETECTOR_CPU_CHANNELS_LAST = True
 
+# Prepare OCR crops as a single grayscale plane (resized with the very same
+# torchvision call transformers' ViTImageProcessor uses) and expand it to the
+# model's 3 identical channels on the device. Bit-identical pixel values, a
+# third of the preprocessing work and of the host->device bytes.
+OCR_PREPROCESS_SINGLE_PLANE = True
+
 # Use mokuro/beam.py (a hand-rolled beam search with an in-place static KV
 # cache and per-crop shared cross-attention K/V) instead of transformers'
 # generic generate(). Same beam-search semantics and the same kernels, so the

@@ -25,6 +25,7 @@ import numpy as np
 import torch
 from PIL import Image
 from scipy.signal.windows import gaussian
+from torchvision.transforms.v2 import functional as tvF
 
 from comic_text_detector.inference import letterbox_input, postprocess_detections
 from comic_text_detector.utils.db_utils import SegDetectorRepresenter
@@ -207,16 +208,90 @@ def split_into_chunks(img, mask_refined, blk, line_idx, textheight, max_ratio=16
 #
 # manga-ocr feeds the ViT a grayscale crop expanded to 3 identical channels:
 #   PIL RGB -> convert("L") -> convert("RGB") -> ViTImageProcessor
+# The stock ViTImageProcessor differs between transformers major versions, and
+# the single-plane path below reproduces whichever one manga-ocr loads:
+# * transformers 5.x (torchvision backend):
+#     pil_to_tensor (uint8 3xHxW) -> tvF.resize(224x224, BILINEAR, antialias=True)
+#     on uint8 -> float32 -> (x - 127.5) / 127.5
+# * transformers 4.x (the PIL "slow" processor manga-ocr requests explicitly):
+#     PIL.Image.resize((224, 224), BILINEAR, reducing_gap=None) on uint8
+#     -> float64 * (1/255) -> float32 -> (x - 0.5) / 0.5
+#   (PIL's and torchvision's antialiased bilinear filters differ by one
+#   8-bit level on ~20% of the pixels; the two normalisations also round
+#   differently, so each version needs its own arithmetic.)
+# Both backends resize the planes independently, so resizing the single L
+# plane and expanding to 3 channels on the device afterwards is bit-identical
+# to the stock processor of the installed transformers, at a third of the
+# work and of the host->device bytes (tests/test_ocr_preprocess.py checks
+# torch.equal against the stock processor on whichever version is installed).
 # ---------------------------------------------------------------------------
+_OCR_SIZE = [224, 224]
+_OCR_MEAN = 127.5  # 0.5 / (1/255)
+_OCR_STD = 127.5
+_OCR_RESCALE = 1 / 255  # ViTImageProcessor.rescale_factor (4.x arithmetic)
 
 
-def ocr_preprocess(crops, processor):
+def _stock_resize_backend() -> str:
+    """``"torchvision"`` (transformers >= 5) or ``"pil"`` (transformers 4.x).
+
+    Decided from the installed transformers version without importing it (the
+    pipeline workers never import transformers).
+    """
+    try:
+        from importlib.metadata import version
+
+        major = int(version("transformers").split(".")[0])
+    except (ImportError, ValueError):  # transformers not installed / unparsable version
+        return "torchvision"
+    return "pil" if major < 5 else "torchvision"
+
+
+OCR_RESIZE_BACKEND = _stock_resize_backend()
+
+
+def _to_gray(item):
+    """PIL image or uint8 array -> uint8 HxW luma exactly as manga-ocr computes it."""
+    if isinstance(item, np.ndarray):
+        if item.ndim == 2:
+            return item
+        item = Image.fromarray(item)
+    if item.mode != "RGB":
+        item = item.convert("RGB")
+    return np.asarray(item.convert("L"))
+
+
+def ocr_preprocess(crops, processor=None, single_plane=True, backend=None):
     """manga-ocr's exact preprocessing for a list of crops (PIL images).
 
-    Returns the float32 CPU ``(N,3,224,224)`` tensor of the stock
-    ``ViTImageProcessor`` (``processor``); ``None`` when there are no crops.
+    Returns a float32 CPU tensor: ``(N,1,224,224)`` with ``single_plane`` (the
+    model process expands it to the 3 identical channels on the device), else
+    ``(N,3,224,224)`` from the stock ``ViTImageProcessor`` (``processor``).
+    ``None`` when there are no crops. ``backend`` (``"torchvision"`` / ``"pil"``)
+    selects which stock processor the single-plane path reproduces; the default
+    (``OCR_RESIZE_BACKEND``) follows the installed transformers version.
     """
     if not crops:
         return None
-    crops = [im.convert("L").convert("RGB") for im in crops]
-    return processor(crops, return_tensors="pt").pixel_values
+    if not single_plane:
+        if processor is None:
+            raise ValueError("ocr_preprocess: the stock path needs the ViTImageProcessor")
+        crops = [im.convert("L").convert("RGB") for im in crops]
+        return processor(crops, return_tensors="pt").pixel_values
+    backend = backend or OCR_RESIZE_BACKEND
+    planes = []
+    if backend == "pil":
+        # transformers 4.x: PIL resize, then rescale (float64 -> float32) and normalise (float32)
+        for item in crops:
+            gray = _to_gray(item)
+            im = gray if isinstance(gray, Image.Image) else Image.fromarray(np.ascontiguousarray(gray))
+            im = im.resize((_OCR_SIZE[1], _OCR_SIZE[0]), resample=Image.BILINEAR, reducing_gap=None)
+            planes.append(torch.from_numpy(np.array(im)).unsqueeze(0))
+        x = torch.stack(planes)  # Nx1x224x224 uint8
+        x = x.to(torch.float64).mul_(_OCR_RESCALE).to(torch.float32)
+        return x.sub_(0.5).div_(0.5)
+    for item in crops:
+        t = torch.from_numpy(np.array(_to_gray(item))).unsqueeze(0)  # 1xHxW uint8 (writable copy)
+        t = tvF.resize(t, _OCR_SIZE, interpolation=tvF.InterpolationMode.BILINEAR, antialias=True)
+        planes.append(t)
+    x = torch.stack(planes)  # Nx1x224x224 uint8
+    return x.to(torch.float32).sub_(_OCR_MEAN).div_(_OCR_STD)

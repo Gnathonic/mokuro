@@ -19,12 +19,30 @@ def get_topk_color(color_list, bins, k=3, color_var=10, bin_tol=0.001):
     color_list, bins = color_list[idx], bins[idx]
     top_colors = [color_list[0]]
     bin_tol = np.sum(bins) * bin_tol
-    if len(color_list) > 1:
-        for color, bin in zip(color_list[1:], bins[1:]):
-            if np.abs(np.array(top_colors) - color).min() > color_var:
-                top_colors.append(color)
-            if len(top_colors) >= k or bin < bin_tol:
+    # Closed form of the original scalar loop (which created a numpy array per
+    # iteration): iterations run over colours 1..last where `last` is the
+    # first colour whose bin is < bin_tol (that colour is still examined), a
+    # colour is picked iff it is > color_var away from every colour picked so
+    # far, and picking stops once k colours are held.
+    n = len(color_list)
+    if n > 1:
+        below = np.flatnonzero(bins[1:] < bin_tol)
+        last = below[0] + 1 if len(below) else n - 1
+        if k <= 1:
+            last = 1  # the original loop always ran its first iteration
+            k = 2
+        cols = color_list[1:last + 1]
+        ok = np.abs(cols - top_colors[0]) > color_var
+        start = 0
+        while len(top_colors) < k:
+            cand = np.flatnonzero(ok[start:])
+            if len(cand) == 0:
                 break
+            j = start + cand[0]
+            c = cols[j]
+            top_colors.append(c)
+            ok &= np.abs(cols - c) > color_var
+            start = j + 1
     return top_colors
 
 def minxor_thresh(threshed, mask, dilate=False):
@@ -58,7 +76,7 @@ def get_topk_masklist(im_grey, pred_mask):
     if len(im_grey.shape) == 3 and im_grey.shape[-1] == 3:
         im_grey = cv2.cvtColor(im_grey, cv2.COLOR_BGR2GRAY)
     msk = np.ascontiguousarray(pred_mask)
-    candidate_grey_px = im_grey[np.where(cv2.erode(msk, np.ones((3,3), np.uint8), iterations=1) > 127)]
+    candidate_grey_px = im_grey[cv2.erode(msk, np.ones((3,3), np.uint8), iterations=1) > 127]
     bin, his = np.histogram(candidate_grey_px, bins=255)
     topk_color = get_topk_color(his, bin, color_var=10, k=3)
     color_range = 30
@@ -70,6 +88,42 @@ def get_topk_masklist(im_grey, pred_mask):
         threshed, xor_sum = minxor_thresh(threshed, msk)
         mask_list.append([threshed, xor_sum])
     return mask_list
+
+def _merge_components(mask_merged, pred_mask, labels, num_labels, keep_candidates, binary_pred=False):
+    """Vectorised form of the greedy per-component merge.
+
+    The original code walked every connected component and accepted it iff
+    OR-ing it into ``mask_merged`` lowered ``sum(mask_merged ^ pred_mask)``.
+    Only pixels of the component where ``mask_merged == 0`` change, each by
+    ``(255 ^ p) - p == 255 - 2p`` for ``p = pred_mask[pixel]``. Components are
+    pixel-disjoint, so one component's acceptance never alters another's
+    delta; the sequential loop therefore equals: accept every component whose
+    total delta is < 0, then OR them all in. ``np.bincount`` computes all
+    deltas in one pass. ``keep_candidates`` is a bool array over labels of the
+    components the original loop considered at all.
+
+    ``binary_pred=True`` (pred_mask is exactly 0/255) uses an integer count
+    formulation: delta < 0  <=>  #(p==255) > #(p==0) over the component's
+    still-unmerged pixels.
+    """
+    if binary_pred:
+        lab2 = labels.astype(np.intp)
+        lab2 *= 2
+        lab2 += (pred_mask != 0)
+        if mask_merged.any():
+            lab2[mask_merged != 0] = 0
+        cnt = np.bincount(lab2.ravel(), minlength=2 * num_labels)
+        keep = (cnt[1:2 * num_labels:2] > cnt[0:2 * num_labels:2]) & keep_candidates
+    else:
+        delta = 255 - 2 * pred_mask.astype(np.int32)
+        delta[mask_merged != 0] = 0
+        score = np.bincount(labels.ravel(), weights=delta.ravel(), minlength=num_labels)
+        keep = (score[:num_labels] < 0) & keep_candidates
+    keep[0] = False  # background label
+    if keep.any():
+        mask_merged[keep[labels]] = 255
+    return mask_merged
+
 
 def merge_mask_list(mask_list, pred_mask, blk: TextBlock = None, pred_thresh=30, text_window=None, filter_with_lines=False, refine_mode=REFINEMASK_INPAINT):
     mask_list.sort(key=lambda x: x[1])
@@ -88,25 +142,16 @@ def merge_mask_list(mask_list, pred_mask, blk: TextBlock = None, pred_thresh=30,
         element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * e_size + 1, 2 * e_size + 1),(e_size, e_size))      
         pred_mask = cv2.erode(pred_mask, element, iterations=1)
         _, pred_mask = cv2.threshold(pred_mask, 60, 255, cv2.THRESH_BINARY)
+    binary_pred = pred_thresh > 0  # thresholded above -> exactly 0/255
     connectivity = 8
     mask_merged = np.zeros_like(pred_mask)
     for ii, (candidate_mask, xor_sum) in enumerate(mask_list):
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(candidate_mask, connectivity, cv2.CV_16U)
-        for label_index, stat, centroid in zip(range(num_labels), stats, centroids):
-            if label_index != 0: # skip background label
-                x, y, w, h, area = stat
-                if w * h < 3:
-                    continue
-                x1, y1, x2, y2 = x, y, x+w, y+h
-                label_local = labels[y1: y2, x1: x2]
-                label_cordinates = np.where(label_local==label_index)
-                tmp_merged = np.zeros_like(label_local, np.uint8)
-                tmp_merged[label_cordinates] = 255
-                tmp_merged = cv2.bitwise_or(mask_merged[y1: y2, x1: x2], tmp_merged)
-                xor_merged = cv2.bitwise_xor(tmp_merged, pred_mask[y1: y2, x1: x2]).sum()
-                xor_origin = cv2.bitwise_xor(mask_merged[y1: y2, x1: x2], pred_mask[y1: y2, x1: x2]).sum()
-                if xor_merged < xor_origin:
-                    mask_merged[y1: y2, x1: x2] = tmp_merged
+        if num_labels <= 1:
+            continue
+        # original loop skipped components whose bounding box has w*h < 3
+        keep_candidates = (stats[:, 2].astype(np.int64) * stats[:, 3]) >= 3
+        mask_merged = _merge_components(mask_merged, pred_mask, labels, num_labels, keep_candidates, binary_pred)
 
     if refine_mode == REFINEMASK_INPAINT:
         mask_merged = cv2.dilate(mask_merged, np.ones((3, 3), np.uint8), iterations=1)
@@ -117,41 +162,41 @@ def merge_mask_list(mask_list, pred_mask, blk: TextBlock = None, pred_thresh=30,
         area_thresh = sorted_area[-2]
     else:
         area_thresh = sorted_area[-1]
-    for label_index, stat, centroid in zip(range(num_labels), stats, centroids):
-        x, y, w, h, area = stat
-        if area < area_thresh:
-            x1, y1, x2, y2 = x, y, x+w, y+h
-            label_local = labels[y1: y2, x1: x2]
-            label_cordinates = np.where(label_local==label_index)
-            tmp_merged = np.zeros_like(label_local, np.uint8)
-            tmp_merged[label_cordinates] = 255
-            tmp_merged = cv2.bitwise_or(mask_merged[y1: y2, x1: x2], tmp_merged)
-            xor_merged = cv2.bitwise_xor(tmp_merged, pred_mask[y1: y2, x1: x2]).sum()
-            xor_origin = cv2.bitwise_xor(mask_merged[y1: y2, x1: x2], pred_mask[y1: y2, x1: x2]).sum()
-            if xor_merged < xor_origin:
-                mask_merged[y1: y2, x1: x2] = tmp_merged
+    # original loop considered every label (incl. 0) with area < area_thresh;
+    # label 0 here is the already-merged foreground, whose delta is 0 anyway.
+    keep_candidates = stats[:, -1] < area_thresh
+    mask_merged = _merge_components(mask_merged, pred_mask, labels, num_labels, keep_candidates, binary_pred)
     return mask_merged
 
 
 def refine_undetected_mask(img: np.ndarray, mask_pred: np.ndarray, mask_refined: np.ndarray, blk_list: List[TextBlock], refine_mode=REFINEMASK_INPAINT):
-    mask_pred[np.where(mask_refined > 30)] = 0
+    # boolean-mask assignment instead of np.where (no int64 index arrays)
+    mask_pred[mask_refined > 30] = 0
     _, pred_mask_t = cv2.threshold(mask_pred, 30, 255, cv2.THRESH_BINARY)
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(pred_mask_t, 4, cv2.CV_16U)
     valid_labels = np.where(stats[:, -1] > 50)[0]
     seg_blk_list = []
     if len(valid_labels) > 0:
-        for lab_index in valid_labels[1:]:
-            x, y, w, h, area = stats[lab_index]
-            bx1, by1 = x, y
-            bx2, by2 = x+w, y+h
-            bbox = [bx1, by1, bx2, by2]
-            bbox_score = -1
-            for blk in blk_list:
-                bbox_s = union_area(blk.xyxy, bbox)
-                if bbox_s > bbox_score:
-                    bbox_score = bbox_s
-            if bbox_score / w / h < 0.5:
-                seg_blk_list.append(TextBlock(bbox))
+        valid_labels = valid_labels[1:]
+        if len(valid_labels) > 0:
+            vs = stats[valid_labels]
+            bx1 = vs[:, 0]; by1 = vs[:, 1]; w = vs[:, 2]; h = vs[:, 3]
+            bx2 = bx1 + w; by2 = by1 + h
+            # vectorised max over blk_list of union_area(blk.xyxy, bbox)
+            bbox_score = np.full(len(valid_labels), -1, dtype=np.int64)
+            if len(blk_list) > 0:
+                bl = np.array([blk.xyxy for blk in blk_list], dtype=np.int64)  # (M, 4)
+                ix1 = np.maximum(bl[:, 0][:, None], bx1[None, :])
+                iy1 = np.maximum(bl[:, 1][:, None], by1[None, :])
+                ix2 = np.minimum(bl[:, 2][:, None], bx2[None, :])
+                iy2 = np.minimum(bl[:, 3][:, None], by2[None, :])
+                inter = np.where((iy2 < iy1) | (ix2 < ix1), -1, (iy2 - iy1) * (ix2 - ix1))
+                bbox_score = np.maximum(bbox_score, inter.max(axis=0))
+            for i, lab_index in enumerate(valid_labels):
+                x, y, w_, h_, area = stats[lab_index]
+                bbox = [x, y, x+w_, y+h_]
+                if bbox_score[i] / w_ / h_ < 0.5:
+                    seg_blk_list.append(TextBlock(bbox))
     if len(seg_blk_list) > 0:
         mask_refined = cv2.bitwise_or(mask_refined, refine_mask(img, mask_pred, seg_blk_list, refine_mode=refine_mode))
     return mask_refined

@@ -13,6 +13,7 @@ from comic_text_detector.inference import TextDetector
 from mokuro import __version__
 from mokuro.cache import cache
 from mokuro.config import (
+    ALLOW_CUDNN_TF32,
     FUSE_CONV_BN,
     NUM_BEAMS,
     USE_FP16,
@@ -24,12 +25,14 @@ from mokuro.utils import imread
 
 _log_once_seen: set = set()
 
+
 def _log_once(msg: str) -> None:
     """Log a warning once per unique message (avoids flooding on batch errors)."""
     if msg in _log_once_seen:
         return
     _log_once_seen.add(msg)
     logger.warning(f"[mokuro] {msg}")
+
 
 # Suppress noisy transformers warnings (e.g. "Some weights not used")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -57,21 +60,26 @@ class MangaPageOcr:
         self.disable_ocr = disable_ocr
 
         if not self.disable_ocr:
-            device = "cpu" if force_cpu else get_device()
+            device = get_device(force_cpu)
+            if device == "cuda":
+                # cuDNN TF32 convolutions make the CUDA detector output drift
+                # from CPU/ROCm output at no speed benefit (ALLOW_CUDNN_TF32).
+                torch.backends.cudnn.allow_tf32 = bool(ALLOW_CUDNN_TF32)
             logger.info(f"Initializing text detector, using device {device}")
             self.text_detector = TextDetector(
                 model_path=cache.comic_text_detector, input_size=detector_input_size, device=device, act="leaky"
             )
 
-            # Fold batch-norm into preceding conv layers: a free speedup at
-            # inference time, no effect on output. Toggle via FUSE_CONV_BN
-            # in mokuro/config.py.
+            # Opt-in: fold batch-norm into the preceding conv layers. Changes the
+            # detector output slightly on CUDA and measured no faster (config.py).
             if FUSE_CONV_BN and hasattr(self.text_detector.net, "fuse"):
                 try:
                     self.text_detector.net.fuse()
-                    logger.info("Fused conv+bn layers in text detector")
-                except Exception:
-                    pass
+                    logger.warning(
+                        "Fused conv+bn layers in text detector (FUSE_CONV_BN): output may differ from upstream"
+                    )
+                except Exception as e:  # noqa: BLE001 - opt-in fast path; fall back to the unfused net
+                    logger.warning(f"FUSE_CONV_BN: fuse() failed ({e}); using the unfused detector")
 
             self.mocr = MangaOcr(pretrained_model_name_or_path, force_cpu)
 
@@ -84,17 +92,17 @@ class MangaPageOcr:
                     self.mocr.model.to(device)
                     self.mocr.model.half()
                     logger.info(f"Moved MangaOcr model to {device} (half precision)")
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 - run on the default device/precision instead
                     logger.warning(f"Could not move model to {device}: {e}. Falling back to default.")
 
-            # torch.compile on CUDA only — MPS support is unstable in PyTorch
-            # 2.x. Toggle via USE_TORCH_COMPILE in mokuro/config.py.
+            # Experimental (off by default; measured slower than eager on the
+            # GPUs tested): torch.compile in the default inductor mode.
             if device == "cuda" and USE_TORCH_COMPILE and hasattr(torch, "compile"):
                 try:
-                    self.text_detector.net = torch.compile(self.text_detector.net, mode="reduce-overhead")
-                    self.mocr.model.encoder = torch.compile(self.mocr.model.encoder, mode="reduce-overhead")
-                    logger.info("Compiled models with torch.compile")
-                except Exception as e:
+                    self.text_detector.net = torch.compile(self.text_detector.net)
+                    self.mocr.model.encoder = torch.compile(self.mocr.model.encoder, dynamic=True)
+                    logger.info("Compiled models with torch.compile (USE_TORCH_COMPILE)")
+                except Exception as e:  # noqa: BLE001 - experimental; eager mode is the fallback
                     logger.debug(f"torch.compile skipped: {e}")
 
             self._device = device
@@ -186,7 +194,7 @@ class MangaPageOcr:
         all_texts = []
 
         if batch_size is None:
-            batch_size = get_default_ocr_batch_size()
+            batch_size = get_default_ocr_batch_size(self._device == "cpu")
 
         gen_config = self.mocr.model.generation_config
         gen_args = {

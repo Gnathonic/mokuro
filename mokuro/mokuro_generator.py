@@ -26,8 +26,8 @@ class MokuroGenerator:
         self.disable_ocr = disable_ocr
 
         # None -> auto-detect from hardware (see mokuro/config.py)
-        self.num_workers = num_workers if num_workers is not None else get_default_num_workers()
-        self.ocr_batch_size = ocr_batch_size if ocr_batch_size is not None else get_default_ocr_batch_size()
+        self.num_workers = num_workers if num_workers is not None else get_default_num_workers(force_cpu)
+        self.ocr_batch_size = ocr_batch_size if ocr_batch_size is not None else get_default_ocr_batch_size(force_cpu)
 
         self.kwargs = kwargs
         self.mpocr = None
@@ -138,8 +138,7 @@ class MokuroGenerator:
                             raise
 
                 # Write per-page OCR cache files.
-                for key in page_results:
-                    result, _ = page_results[key]
+                for key, (result, _) in page_results.items():
                     img_path_rel = img_paths[key]
                     json_path = volume.get_ocr_path(img_path_rel)
                     json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +175,6 @@ class MokuroGenerator:
                 if ignore_errors:
                     logger.error(e)
                 else:
-                    raise e
+                    raise
 
         dump_json(out, volume.path_mokuro)

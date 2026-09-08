@@ -50,6 +50,11 @@ OCR_CHUNK_SIZE = 8
 # than ~4 rarely helps and can hurt on spinning disks / network mounts).
 IMAGE_LOAD_THREADS = 4
 
+# Page image decoder: "auto" decodes plain RGB/grayscale JPEGs with
+# cv2.imread (pixel-identical to the PIL path, ~2x faster) and everything else
+# with PIL; "pil" forces the PIL path for every file.
+IMAGE_DECODER = "auto"
+
 # -- OCR decoding quality vs. speed -----------------------------------------
 # Beam width for the OCR transformer:
 #   None -> use the model's own generation config (num_beams=4 — identical

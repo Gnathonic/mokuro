@@ -11,12 +11,15 @@ from scipy.signal.windows import gaussian
 
 from comic_text_detector.inference import TextDetector
 from mokuro import __version__
+from mokuro.beam import BeamSearchOCR
 from mokuro.cache import cache
 from mokuro.config import (
     ALLOW_CUDNN_TF32,
+    BEAM_SYNC_LAG,
     DETECTOR_CPU_CHANNELS_LAST,
     FUSE_CONV_BN,
     NUM_BEAMS,
+    USE_CUSTOM_BEAM,
     USE_FP16,
     USE_TORCH_COMPILE,
     get_default_ocr_batch_size,
@@ -104,6 +107,10 @@ class MangaPageOcr:
                     logger.info(f"Moved MangaOcr model to {device} (half precision)")
                 except Exception as e:  # noqa: BLE001 - run on the default device/precision instead
                     logger.warning(f"Could not move model to {device}: {e}. Falling back to default.")
+
+            # Beam search: mokuro/beam.py by default; transformers' generate()
+            # as the fallback for non-default decoding settings.
+            self._beam = BeamSearchOCR(self.mocr.model, sync_lag=BEAM_SYNC_LAG) if USE_CUSTOM_BEAM else None
 
             # Experimental (off by default; measured slower than eager on the
             # GPUs tested): torch.compile in the default inductor mode.
@@ -240,7 +247,10 @@ class MangaPageOcr:
                 pixel_values = pixel_values.half()
 
             with torch.inference_mode():
-                generated_ids = self.mocr.model.generate(pixel_values, **gen_args)
+                if self._beam is not None and self._beam.matches(gen_args):
+                    generated_ids = self._beam.generate(pixel_values)
+                else:
+                    generated_ids = self.mocr.model.generate(pixel_values, **gen_args)
 
             texts = self.mocr.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
             for text in texts:

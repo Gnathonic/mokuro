@@ -55,6 +55,8 @@ IMAGE_LOAD_THREADS = 4
 #           output to upstream mokuro / manga-ocr, best accuracy)
 #   1    -> greedy decoding (fastest; occasionally misreads ambiguous glyphs)
 #   4    -> force beam search (matches upstream default quality)
+# Anything other than the model default also disables USE_CUSTOM_BEAM's fast
+# path (transformers' generate() is used instead).
 NUM_BEAMS = None
 
 # -- GPU feature toggles ----------------------------------------------------
@@ -86,6 +88,20 @@ ALLOW_CUDNN_TF32 = False
 # on the CPU (oneDNN keeps its blocked layout between conv layers). ~1.8-2x on
 # the detector forward; no effect on GPU.
 DETECTOR_CPU_CHANNELS_LAST = True
+
+# Use mokuro/beam.py (a hand-rolled beam search with an in-place static KV
+# cache and per-crop shared cross-attention K/V) instead of transformers'
+# generic generate(). Same beam-search semantics and the same kernels, so the
+# output is identical; it removes the per-step Python glue that dominates the
+# decoder on CPU. Automatically falls back to generate() when the requested
+# decoding differs from the model's default (e.g. NUM_BEAMS=1).
+USE_CUSTOM_BEAM = True
+
+# Number of decoder steps the host may run ahead of the GPU before checking
+# the "all sequences finished" flag (CUDA/ROCm only). 0 = block on the flag
+# every step; 1 = read the previous step's flag (overlaps CPU dispatch with GPU
+# execution; at most one wasted step per batch, output unchanged).
+BEAM_SYNC_LAG = 1
 
 # ===========================================================================
 # Automatic hardware detection — usually nothing to edit below this line.

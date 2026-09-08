@@ -44,10 +44,12 @@ def run(
         unzip: Extract volumes in zip/cbz format in their original location.
         legacy_html: Enable legacy HTML output. If True, acts as if --unzip is True.
         as_one_file: Applies only to legacy HTML. If False, generate separate CSS and JS files instead of embedding them in the HTML file.
-        num_workers: Pages processed concurrently per chunk. Default: auto-detected from hardware (see mokuro/config.py).
+        num_workers: Number of CPU-side pipeline worker processes (decode, post-processing, crops). 0 = single process.
+            Default: auto-detected (see mokuro/config.py).
         ocr_batch_size: Text-line crops per batched OCR call. Default: auto-detected from hardware.
         fp16: Run the OCR model in half precision on CUDA/ROCm/MPS (1.07x-4.9x faster depending on the GPU; not exact: changes 0.19% of characters on ~2.6% of pages of a 140-volume set, see README "Precision policy"; boxes unaffected). Default: fp32, identical to upstream.
-        num_beams: Beam width for OCR decoding. Default: model default (4, highest quality). Use 1 for faster greedy decoding.
+        num_beams: Beam width for OCR decoding. Default: model default (4, identical output to upstream).
+            Other values (e.g. 1 = greedy) are faster but change the OCR text; see mokuro/config.py.
         version: Print the version of mokuro and exit.
     """
 
@@ -149,19 +151,22 @@ def run(
             tmp_dir = None
 
         num_sucessful = 0
-        for i, volume in enumerate(vc):
-            logger.info(f"Processing {i + 1}/{len(vc)}: {volume.path_in}")
+        try:
+            for i, volume in enumerate(vc):
+                logger.info(f"Processing {i + 1}/{len(vc)}: {volume.path_in}")
 
-            try:
-                volume.unzip(tmp_dir)
-                mg.process_volume(volume, ignore_errors=ignore_errors, no_cache=no_cache)
-                if legacy_html:
-                    generate_legacy_html(volume, as_one_file=as_one_file, ignore_errors=ignore_errors)
+                try:
+                    volume.unzip(tmp_dir)
+                    mg.process_volume(volume, ignore_errors=ignore_errors, no_cache=no_cache)
+                    if legacy_html:
+                        generate_legacy_html(volume, as_one_file=as_one_file, ignore_errors=ignore_errors)
 
-            except Exception:  # noqa: BLE001 - logged with traceback; continue with the next volume
-                logger.exception(f"Error while processing {volume.path_in}")
-            else:
-                num_sucessful += 1
+                except Exception:  # noqa: BLE001 - logged with traceback; continue with the next volume
+                    logger.exception(f"Error while processing {volume.path_in}")
+                else:
+                    num_sucessful += 1
+        finally:
+            mg.close()
 
         logger.info(f"Processed successfully: {num_sucessful}/{len(vc)}")
 

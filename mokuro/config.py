@@ -5,19 +5,25 @@ your machine. Every value below is a *default*: command-line flags
 (``--num_workers``, ``--ocr_batch_size``, ``--num_beams``) and library
 arguments always take precedence over it, but if you never pass flags, the
 values chosen here (or auto-detected from your hardware) apply everywhere —
-CLI, mokuro-bridge, and library callers alike.
+CLI and library callers alike.
 
-Quick guide to what matters on your machine:
+Every default in this file keeps the OCR output identical to upstream mokuro
+(same boxes, same text; see CHANGES.md for the exact parity statement). The
+only knobs that trade accuracy for speed are ``NUM_BEAMS`` (when set to a
+value other than the model's own 4) and ``FUSE_CONV_BN`` / ``ALLOW_CUDNN_TF32``
+(which change the detector's output slightly on CUDA); all of them are off by
+default.
 
-* **Apple Silicon (M1–M4)** — unified memory lets you run a high worker count
-  and a large OCR batch. Defaults: 8 workers, batch 64.
-* **NVIDIA GPU (CUDA)** — the GPU is the bottleneck, so fewer workers (4) and
-  a moderate batch (32) avoid memory pressure; ``--fp16`` gives the biggest
-  win here (not exact, see ``USE_FP16``).
-* **CPU only** — modest concurrency (cores / 2) and a small batch (16) keep
-  latency per page low; fp16/fusion are irrelevant on CPU.
-* Running out of memory? Lower ``OCR_BATCH_SIZE`` / ``NUM_WORKERS``.
-* Want better OCR accuracy at the cost of speed? Raise ``NUM_BEAMS`` to 4.
+How the work is split:
+
+* **GPU (CUDA / ROCm / MPS)** — the main process keeps the single GPU context
+  (text-detector forward, OCR beam search); ``NUM_WORKERS`` CPU worker
+  processes decode pages, post-process the detector output and prepare the
+  OCR crops in parallel.
+* **CPU only** — the same pipeline, with the models in the main process and
+  a couple of worker processes for the page handling.
+* Running out of memory? Lower ``NUM_WORKERS`` (each worker costs ~1 GB of
+  RAM, mostly the torch runtime) or ``OCR_BATCH_SIZE``.
 """
 
 import os
@@ -26,29 +32,30 @@ import platform
 import torch
 
 # ===========================================================================
-# ⚙️  EDIT ME — per-machine tuning knobs
+# EDIT ME — per-machine tuning knobs
 # ===========================================================================
 # Set a knob to a concrete value to force it everywhere; leave it ``None`` to
 # keep the automatic, hardware-aware default (functions at the bottom of this
 # file). CLI flags still override whichever choice you make here.
 
 # -- concurrency ------------------------------------------------------------
-# Pages loaded & detected concurrently per processing chunk.
-#   Apple Silicon: 8 · NVIDIA: 4 · CPU: cores / 2      (None = auto)
+# Number of CPU-side pipeline worker *processes* (page decode, detector
+# post-processing, mask refinement, crop extraction, OCR preprocessing); the
+# models stay in the main process.  None -> 4 (capped at cores - 1) with a
+# GPU, 2 on a CPU-only machine (the model process needs the cores itself).
+# 0 -> no extra processes, everything in one process.
+# The CLI flag --num_workers overrides this.
 NUM_WORKERS = None
 
-# Text-line crops sent to the OCR model per batched generate() call.
-# Bigger batches use the GPU better but need more memory.
-#   Apple Silicon: 64 · NVIDIA: 32 · CPU: 16           (None = auto)
+# GPU mode: maximum pages in flight between "submitted for decode" and "OCR
+# crops received" (bounds RAM: ~40 MB per page). None -> 2 * workers + 2.
+PIPELINE_MAX_INFLIGHT = None
+
+# Text-line crops sent to the OCR model per batched beam-search call. Bigger
+# batches use the GPU better but need more memory (bs128 peaks at ~1.6 GB of
+# VRAM on the test volume; lower it on small GPUs).
+#   CUDA/ROCm: 128 · Apple Silicon (MPS): 64 · CPU: 32       (None = auto)
 OCR_BATCH_SIZE = None
-
-# Pages processed per chunk before a batched OCR pass runs.
-# (The effective chunk is max(OCR_CHUNK_SIZE, num_workers).)
-OCR_CHUNK_SIZE = 8
-
-# Threads used to decode page images (disk I/O is the bottleneck, so more
-# than ~4 rarely helps and can hurt on spinning disks / network mounts).
-IMAGE_LOAD_THREADS = 4
 
 # Page image decoder: "auto" decodes plain RGB/grayscale JPEGs with
 # cv2.imread (pixel-identical to the PIL path, ~2x faster) and everything else
@@ -59,8 +66,9 @@ IMAGE_DECODER = "auto"
 # Beam width for the OCR transformer:
 #   None -> use the model's own generation config (num_beams=4 — identical
 #           output to upstream mokuro / manga-ocr, best accuracy)
-#   1    -> greedy decoding (fastest; occasionally misreads ambiguous glyphs)
-#   4    -> force beam search (matches upstream default quality)
+#   1    -> greedy decoding: measured 25-28% faster on CPU, 3-9% on GPU, but
+#           ~5% of characters change (4.9% page CER) on the test volume
+#   2    -> ~3.3% CER for 12-14% on CPU (not a mild middle ground)
 # Anything other than the model default also disables USE_CUSTOM_BEAM's fast
 # path (transformers' generate() is used instead).
 NUM_BEAMS = None
@@ -95,6 +103,12 @@ ALLOW_CUDNN_TF32 = False
 
 # -- exact-parity optimisations (all on; each can be switched off to get the
 #    reference code path back, e.g. when bisecting a problem) ---------------
+# Compute the refined text mask lazily, at page level: only pages that contain
+# a text line whose warped crop exceeds max_ratio (and therefore has to be
+# split into chunks) ever read it. Identical output; ~2x fewer CPU seconds
+# per page on the test volume.
+LAZY_MASK_REFINE = True
+
 # Run the text detector in channels_last (NHWC) memory format when it executes
 # on the CPU (oneDNN keeps its blocked layout between conv layers). ~1.8-2x on
 # the detector forward; no effect on GPU.
@@ -142,37 +156,25 @@ def is_apple_silicon() -> bool:
 
 
 def get_default_num_workers(force_cpu: bool = False) -> int:
-    """
-    Number of pages loaded (and detected) concurrently per chunk.
-
-    Apple Silicon machines benefit from a high worker count thanks to their
-    unified memory and many cores; NVIDIA GPUs are usually memory-bound, and
-    plain CPUs prefer a modest thread count. Override by setting
-    ``NUM_WORKERS`` above.
-    """
+    """Number of pipeline worker processes (see ``NUM_WORKERS``)."""
     if NUM_WORKERS is not None:
-        return NUM_WORKERS
-
+        return max(0, int(NUM_WORKERS))
     cpu_count = os.cpu_count() or 4
-
-    if not force_cpu and is_apple_silicon():
-        # Cap at 8-10 to avoid excessive memory usage while staying very fast.
-        return min(8, max(1, int(cpu_count * 0.75)))
-
-    if get_device(force_cpu) == "cuda":
-        return min(4, cpu_count)
-
-    return max(1, cpu_count // 2)
+    if get_device(force_cpu) != "cpu":
+        return max(1, min(4, cpu_count - 1))
+    # CPU only: the model process itself needs the cores; 2 workers measured
+    # best (1.16x over in-process on a 7950X).
+    return 2 if cpu_count >= 4 else 0
 
 
 def get_default_ocr_batch_size(force_cpu: bool = False) -> int:
     """
-    Number of text-line crops fed to the OCR model per ``generate()`` call.
+    Number of text-line crops fed to the OCR model per beam-search call.
 
-    Unified memory (Apple Silicon) tolerates larger batches without OOM;
-    dedicated NVIDIA GPUs usually sit well in the 32-64 range; CPUs want small
-    batches to keep latency per page low. Override by setting
-    ``OCR_BATCH_SIZE`` above.
+    Dedicated GPUs (CUDA/ROCm) get cheaper per crop up to ~128 crops per call;
+    unified memory (Apple Silicon) tolerates 64; CPUs are nearly
+    batch-insensitive (32 measured within a few % of 16 either way). Override
+    by setting ``OCR_BATCH_SIZE`` above.
     """
     if OCR_BATCH_SIZE is not None:
         return OCR_BATCH_SIZE
@@ -183,6 +185,36 @@ def get_default_ocr_batch_size(force_cpu: bool = False) -> int:
         return 64
 
     if device == "cuda":
-        return 32
+        return 128
 
-    return 16
+    return 32
+
+
+# ---------------------------------------------------------------------------
+# Propagating runtime overrides to worker processes
+# ---------------------------------------------------------------------------
+# Worker processes are *spawned* (fresh interpreters), so they re-import this
+# module and see the file's defaults. Library callers that change knobs at
+# runtime (``mokuro.config.X = ...``) would otherwise not be honoured in the
+# workers; the parent therefore snapshots the uppercase knobs and the workers
+# re-apply them, also into the modules that imported the names directly.
+
+
+def snapshot():
+    """All uppercase knobs of this module as a plain dict (pickleable)."""
+    return {k: v for k, v in globals().items() if k.isupper() and not k.startswith("_")}
+
+
+def apply_snapshot(snap):
+    import sys
+
+    g = globals()
+    for k, v in snap.items():
+        g[k] = v
+    for name, mod in list(sys.modules.items()):
+        if mod is None or name == __name__:
+            continue
+        if name.startswith(("mokuro", "comic_text_detector")):
+            for k, v in snap.items():
+                if hasattr(mod, k):
+                    setattr(mod, k, v)

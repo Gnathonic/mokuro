@@ -44,8 +44,8 @@ def run(
         unzip: Extract volumes in zip/cbz format in their original location.
         legacy_html: Enable legacy HTML output. If True, acts as if --unzip is True.
         as_one_file: Applies only to legacy HTML. If False, generate separate CSS and JS files instead of embedding them in the HTML file.
-        num_workers: Number of CPU-side pipeline worker processes (decode, post-processing, crops). 0 = single process.
-            Default: auto-detected (see mokuro/config.py).
+        num_workers: Number of worker processes. On a GPU: CPU-side pipeline workers (decode, post-processing, crops);
+            on CPU only: model shard processes. 0 = single process. Default: auto-detected (see mokuro/config.py).
         ocr_batch_size: Text-line crops per batched OCR call. Default: auto-detected from hardware.
         fp16: Run the OCR model in half precision on CUDA/ROCm/MPS (1.07x-4.9x faster depending on the GPU; not exact: changes 0.19% of characters on ~2.6% of pages of a 140-volume set, see README "Precision policy"; boxes unaffected). Default: fp32, identical to upstream.
         num_beams: Beam width for OCR decoding. Default: model default (4, identical output to upstream).

@@ -16,7 +16,7 @@ Result tuples (worker -> main):
     ("err",  idx, stage, message)
 
 ``InlinePool`` offers the same interface but executes tasks synchronously in
-the caller's process (``num_workers=0``); the
+the caller's process (``num_workers=0`` and the CPU shard processes); the
 driver loop in :func:`mokuro.mokuro_generator.process_pages` is identical for
 both, so the output is the same by construction.
 

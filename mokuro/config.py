@@ -20,14 +20,17 @@ How the work is split:
   (text-detector forward, OCR beam search); ``NUM_WORKERS`` CPU worker
   processes decode pages, post-process the detector output and prepare the
   OCR crops in parallel.
-* **CPU only** — the same pipeline, with the models in the main process and
-  a couple of worker processes for the page handling.
-* Running out of memory? Lower ``NUM_WORKERS`` (each worker costs ~1 GB of
-  RAM, mostly the torch runtime) or ``OCR_BATCH_SIZE``.
+* **CPU only** — the volume's pages are sharded over ``NUM_WORKERS`` model
+  processes (each with its own copy of the models and a share of the cores),
+  which is much faster than one process using all cores.
+* Running out of memory? Lower ``NUM_WORKERS`` (each GPU-mode worker costs
+  ~1 GB of RAM, mostly the torch runtime; each CPU-mode shard 2-3 GB) or
+  ``OCR_BATCH_SIZE``.
 """
 
 import os
 import platform
+import subprocess
 
 import torch
 
@@ -39,17 +42,34 @@ import torch
 # file). CLI flags still override whichever choice you make here.
 
 # -- concurrency ------------------------------------------------------------
-# Number of CPU-side pipeline worker *processes* (page decode, detector
-# post-processing, mask refinement, crop extraction, OCR preprocessing); the
-# models stay in the main process.  None -> 4 (capped at cores - 1) with a
-# GPU, 2 on a CPU-only machine (the model process needs the cores itself).
-# 0 -> no extra processes, everything in one process.
+# Number of worker *processes*. Meaning depends on the compute device:
+#   GPU (CUDA/ROCm/MPS): CPU-side pipeline workers (page decode, detector
+#       post-processing, mask refinement, crop extraction, OCR preprocessing);
+#       the models stay in the main process.  None -> 4 (capped at cores - 1).
+#   CPU only: model shard processes, each running the whole per-page pipeline
+#       on its own block of cores.  None -> one per L3 cache domain (CCD on
+#       AMD; e.g. 2 on a 7950X, 4 on a 9960X), or physical_cores // 4 when the
+#       topology is unknown; 1 when there are fewer than 4 physical cores.
+#   0 (or 1 on CPU) -> no extra processes, everything in one process.
 # The CLI flag --num_workers overrides this.
 NUM_WORKERS = None
 
 # GPU mode: maximum pages in flight between "submitted for decode" and "OCR
 # crops received" (bounds RAM: ~40 MB per page). None -> 2 * workers + 2.
 PIPELINE_MAX_INFLIGHT = None
+
+# CPU-only mode: torch/OpenCV threads per shard process.
+# None -> the physical cores of the shard's core block (= physical cores / shards).
+CPU_THREADS_PER_PROCESS = None
+
+# CPU-only mode: pages per work item handed to a shard. 1 gives the best load
+# balance (measured 1 > 2 on both test CPUs; CPU OCR cost is batch-insensitive).
+CPU_CHUNK_PAGES = 1
+
+# CPU-only mode: pin each shard to its own block of physical cores (+ SMT
+# siblings), aligned to L3 domains when the shard count is a multiple of the
+# domain count. Linux only; ignored elsewhere.
+CPU_PIN_CORES = True
 
 # Text-line crops sent to the OCR model per batched beam-search call. Bigger
 # batches use the GPU better but need more memory (bs128 peaks at ~1.6 GB of
@@ -155,16 +175,90 @@ def is_apple_silicon() -> bool:
     return platform.machine() in ("arm64", "aarch64")
 
 
+def _read_cpu_list(path):
+    out = set()
+    with open(path) as f:
+        for part in f.read().strip().split(","):
+            if not part:
+                continue
+            if "-" in part:
+                a, b = part.split("-")
+                out.update(range(int(a), int(b) + 1))
+            else:
+                out.add(int(part))
+    return out
+
+
+def get_core_topology():
+    """``(l3_domains, sibling_groups)``: lists of sorted logical-CPU lists read
+    from Linux sysfs; ``([], [])`` when unavailable (non-Linux)."""
+    cpu_count = os.cpu_count() or 1
+    base = "/sys/devices/system/cpu"
+    try:
+        sib, l3 = {}, {}
+        for n in range(cpu_count):
+            s = frozenset(_read_cpu_list(f"{base}/cpu{n}/topology/thread_siblings_list"))
+            sib[s] = None
+            try:
+                l3[frozenset(_read_cpu_list(f"{base}/cpu{n}/cache/index3/shared_cpu_list"))] = None
+            except OSError:
+                pass
+        sibs = sorted((sorted(s) for s in sib), key=lambda x: x[0])
+        l3s = sorted((sorted(s) for s in l3), key=lambda x: x[0])
+        return l3s, sibs
+    except OSError:
+        return [], []
+
+
+def get_physical_cores() -> int:
+    """Physical core count (SMT siblings collapsed)."""
+    cpu_count = os.cpu_count() or 4
+    _, sibs = get_core_topology()
+    if sibs:
+        return len(sibs)
+    if platform.system() == "Darwin":
+        try:
+            return max(1, int(subprocess.check_output(["sysctl", "-n", "hw.physicalcpu"], text=True).strip()))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        return cpu_count
+    # Unknown topology: assume SMT.
+    return max(1, cpu_count // 2)
+
+
+def get_default_cpu_processes() -> int:
+    """CPU-only mode: number of model shard processes (see NUM_WORKERS)."""
+    cores = get_physical_cores()
+    if cores < 4:
+        return 1
+    l3s, _ = get_core_topology()
+    if len(l3s) >= 2:
+        return len(l3s)
+    # Single L3 domain (e.g. Ryzen 7 5800X, Apple M-series): measured best at
+    # ~2 physical cores per shard (5800X: 4 shards 1.19x vs 2 shards 1.05x),
+    # bounded by memory (each shard holds its own models, ~2.5 GB).
+    n = max(2, cores // 2)
+    try:
+        if os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo") as f:
+                kb = int(next(line for line in f if line.startswith("MemTotal")).split()[1])
+            total_gb = kb / 2**20
+        else:
+            total_gb = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()) / 2**30
+        n = max(1, min(n, int((total_gb - 4) // 2.5)))
+    except (OSError, ValueError, StopIteration, subprocess.SubprocessError):
+        pass  # total RAM unknown: keep the core-based shard count
+    return n
+
+
 def get_default_num_workers(force_cpu: bool = False) -> int:
-    """Number of pipeline worker processes (see ``NUM_WORKERS``)."""
+    """Number of worker processes (see ``NUM_WORKERS`` for the two meanings)."""
     if NUM_WORKERS is not None:
         return max(0, int(NUM_WORKERS))
-    cpu_count = os.cpu_count() or 4
     if get_device(force_cpu) != "cpu":
+        cpu_count = os.cpu_count() or 4
         return max(1, min(4, cpu_count - 1))
-    # CPU only: the model process itself needs the cores; 2 workers measured
-    # best (1.16x over in-process on a 7950X).
-    return 2 if cpu_count >= 4 else 0
+    return get_default_cpu_processes()
 
 
 def get_default_ocr_batch_size(force_cpu: bool = False) -> int:

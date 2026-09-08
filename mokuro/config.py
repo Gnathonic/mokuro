@@ -103,6 +103,12 @@ USE_CUSTOM_BEAM = True
 # execution; at most one wasted step per batch, output unchanged).
 BEAM_SYNC_LAG = 1
 
+# When transformers' generate() is used (custom beam off or not applicable):
+# skip the per-step re-gather of the cross-attention KV cache, which is a
+# semantic no-op in beam search (beam indices never leave an item's group and
+# every beam holds the same encoder K/V). Identical output.
+SKIP_CROSS_ATTN_CACHE_REORDER = True
+
 # ===========================================================================
 # Automatic hardware detection — usually nothing to edit below this line.
 # ===========================================================================

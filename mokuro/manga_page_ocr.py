@@ -19,12 +19,14 @@ from mokuro.config import (
     DETECTOR_CPU_CHANNELS_LAST,
     FUSE_CONV_BN,
     NUM_BEAMS,
+    SKIP_CROSS_ATTN_CACHE_REORDER,
     USE_CUSTOM_BEAM,
     USE_FP16,
     USE_TORCH_COMPILE,
     get_default_ocr_batch_size,
     get_device,
 )
+from mokuro.hf_patches import install_skip_cross_attn_cache_reorder
 from mokuro.utils import imread
 
 _log_once_seen: set = set()
@@ -109,8 +111,11 @@ class MangaPageOcr:
                     logger.warning(f"Could not move model to {device}: {e}. Falling back to default.")
 
             # Beam search: mokuro/beam.py by default; transformers' generate()
-            # as the fallback for non-default decoding settings.
+            # (with the cache-reorder patch) as the fallback for non-default
+            # decoding settings.
             self._beam = BeamSearchOCR(self.mocr.model, sync_lag=BEAM_SYNC_LAG) if USE_CUSTOM_BEAM else None
+            if SKIP_CROSS_ATTN_CACHE_REORDER:
+                install_skip_cross_attn_cache_reorder(self.mocr.model)
 
             # Experimental (off by default; measured slower than eager on the
             # GPUs tested): torch.compile in the default inductor mode.

@@ -11,6 +11,7 @@ from scipy.signal.windows import gaussian
 
 from comic_text_detector.inference import TextDetector
 from mokuro import __version__
+from mokuro import config as _config
 from mokuro.beam import BeamSearchOCR
 from mokuro.cache import cache
 from mokuro.config import (
@@ -21,7 +22,6 @@ from mokuro.config import (
     NUM_BEAMS,
     SKIP_CROSS_ATTN_CACHE_REORDER,
     USE_CUSTOM_BEAM,
-    USE_FP16,
     USE_TORCH_COMPILE,
     get_default_ocr_batch_size,
     get_device,
@@ -98,11 +98,9 @@ class MangaPageOcr:
 
             self.mocr = MangaOcr(pretrained_model_name_or_path, force_cpu)
 
-            # Move the OCR transformer to the active device and use half
-            # precision on GPUs for faster inference with negligible accuracy
-            # loss (the model was trained with fp32, fp16 is fine for OCR).
-            # Toggle via USE_FP16 in mokuro/config.py.
-            if device != "cpu" and USE_FP16:
+            # OCR precision on GPUs: fp32 (default, identical to upstream) or
+            # fp16 (--fp16 / USE_FP16; faster, not exact — see config.py).
+            if device != "cpu" and _config.USE_FP16:
                 try:
                     self.mocr.model.to(device)
                     self.mocr.model.half()

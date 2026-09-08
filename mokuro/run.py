@@ -26,6 +26,7 @@ def run(
     num_workers: int | None = None,
     ocr_batch_size: int | None = None,
     num_beams: int | None = None,
+    fp16: bool = False,
     version: bool = False,
 ):
     """
@@ -45,6 +46,7 @@ def run(
         as_one_file: Applies only to legacy HTML. If False, generate separate CSS and JS files instead of embedding them in the HTML file.
         num_workers: Pages processed concurrently per chunk. Default: auto-detected from hardware (see mokuro/config.py).
         ocr_batch_size: Text-line crops per batched OCR call. Default: auto-detected from hardware.
+        fp16: Run the OCR model in half precision on CUDA/ROCm/MPS (1.07x-4.9x faster depending on the GPU; not exact: changes 0.19% of characters on ~2.6% of pages of a 140-volume set, see README "Precision policy"; boxes unaffected). Default: fp32, identical to upstream.
         num_beams: Beam width for OCR decoding. Default: model default (4, highest quality). Use 1 for faster greedy decoding.
         version: Print the version of mokuro and exit.
     """
@@ -121,6 +123,14 @@ def run(
         if inp.lower() not in ("y", "yes"):
             return
 
+    if fp16:
+        from mokuro import config as _cfg
+
+        _cfg.USE_FP16 = True
+        logger.warning(
+            "fp16 OCR enabled (--fp16): faster, but not exact — a small fraction of characters may differ from fp32"
+        )
+
     mg = MokuroGenerator(
         pretrained_model_name_or_path=pretrained_model_name_or_path,
         force_cpu=force_cpu,
@@ -148,7 +158,7 @@ def run(
                 if legacy_html:
                     generate_legacy_html(volume, as_one_file=as_one_file, ignore_errors=ignore_errors)
 
-            except Exception:
+            except Exception:  # noqa: BLE001 - logged with traceback; continue with the next volume
                 logger.exception(f"Error while processing {volume.path_in}")
             else:
                 num_sucessful += 1

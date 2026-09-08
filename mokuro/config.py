@@ -10,9 +10,10 @@ CLI, mokuro-bridge, and library callers alike.
 Quick guide to what matters on your machine:
 
 * **Apple Silicon (M1–M4)** — unified memory lets you run a high worker count
-  and a large OCR batch. Defaults: 8 workers, batch 64, fp16 on.
+  and a large OCR batch. Defaults: 8 workers, batch 64.
 * **NVIDIA GPU (CUDA)** — the GPU is the bottleneck, so fewer workers (4) and
-  a moderate batch (32) avoid memory pressure; fp16 gives the biggest win here.
+  a moderate batch (32) avoid memory pressure; ``--fp16`` gives the biggest
+  win here (not exact, see ``USE_FP16``).
 * **CPU only** — modest concurrency (cores / 2) and a small batch (16) keep
   latency per page low; fp16/fusion are irrelevant on CPU.
 * Running out of memory? Lower ``OCR_BATCH_SIZE`` / ``NUM_WORKERS``.
@@ -60,9 +61,14 @@ IMAGE_LOAD_THREADS = 4
 NUM_BEAMS = None
 
 # -- GPU feature toggles ----------------------------------------------------
-# fp16 (half precision) inference on CUDA/MPS. Big speedup on GPU, negligible
-# accuracy loss. Only applies when a GPU is active; ignored on CPU.
-USE_FP16 = True
+# OCR transformer precision on CUDA/ROCm/MPS (ignored on CPU). Default fp32:
+# byte-identical to upstream on every tested volume/tier. fp16 (``--fp16`` on
+# the CLI, or ``USE_FP16 = True`` here) is 1.6x faster on an RTX 4090 and 4.9x
+# on an RX 9070 XT in this pipeline, but is NOT exact: measured on 140 volumes
+# (2.52 M characters) it changes 0.19% of the characters on 26 pages per 1000
+# (mostly hallucination-prone lines; occasionally real text, e.g. a dropped
+# bracket). Boxes are never affected. Details: README, "Precision policy".
+USE_FP16 = False
 
 # Fold batch-norm layers into the preceding conv layers of the text detector
 # at load time. Measured: no speed gain on any tested GPU/CPU and the detector
